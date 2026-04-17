@@ -24,7 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-longshotel = "longshotel.cli:main"
+el-longshot = "longshotel.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

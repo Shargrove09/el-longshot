@@ -8,10 +8,14 @@ from datetime import datetime, timezone
 from rich.console import Console
 
 from longshotel.client import fetch_hotels
-from longshotel.config import Settings
+from longshotel.config import NotifyMode, Settings
 from longshotel.display import print_hotels
 from longshotel.models import Hotel
-from longshotel.notifications import send_discord_notification
+from longshotel.notifications import (
+    send_discord_notification,
+    send_discord_soldout_notification,
+    send_discord_summary,
+)
 
 console = Console()
 
@@ -32,6 +36,16 @@ async def run_monitor(settings: Settings | None = None) -> None:
     """
     if settings is None:
         settings = Settings()
+
+    # Resolve effective notify mode — require Discord to be configured
+    notify_mode = settings.notify_mode
+    if not settings.discord_configured and notify_mode != NotifyMode.off:
+        console.print(
+            "[yellow]⚠ notify_mode is "
+            f"'{notify_mode.value}' but no Discord credentials are set "
+            "— notifications disabled.[/yellow]\n"
+        )
+        notify_mode = NotifyMode.off
 
     previous_available: set[int] | None = None
     hotels_by_id: dict[int, Hotel] = {}
@@ -74,12 +88,25 @@ async def run_monitor(settings: Settings | None = None) -> None:
                     name = h.name if h else f"Hotel #{hid}"
                     console.print(f"  [red]- SOLD OUT:[/red] {name}")
 
-                # Fire notifications
-                new_hotels = [hotels_by_id[hid] for hid in newly_available]
-                if settings.discord_webhook_url and new_hotels:
+                # Fire change notifications
+                if notify_mode == NotifyMode.changes and settings.discord_configured:
+                    new_hotels = [hotels_by_id[hid] for hid in newly_available]
+                    soldout_hotels = [
+                        hotels_by_id[hid]
+                        for hid in newly_soldout
+                        if hid in hotels_by_id
+                    ]
                     try:
                         await send_discord_notification(
-                            settings.discord_webhook_url, new_hotels
+                            settings, new_hotels,
+                        )
+                    except Exception as exc:
+                        console.print(
+                            f"  [red]Discord notification failed: {exc}[/red]"
+                        )
+                    try:
+                        await send_discord_soldout_notification(
+                            settings, soldout_hotels,
                         )
                     except Exception as exc:
                         console.print(
@@ -89,6 +116,17 @@ async def run_monitor(settings: Settings | None = None) -> None:
                 console.print(
                     f"[dim][{now}] No changes "
                     f"({len(current_available)} available)[/dim]"
+                )
+
+        # Fire summary notification every poll (after first run)
+        if notify_mode == NotifyMode.every and settings.discord_configured:
+            try:
+                await send_discord_summary(
+                    settings, hotels,
+                )
+            except Exception as exc:
+                console.print(
+                    f"  [red]Discord summary failed: {exc}[/red]"
                 )
 
         previous_available = current_available

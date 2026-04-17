@@ -2,7 +2,22 @@
 
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic_settings import BaseSettings
+
+
+class NotifyMode(str, Enum):
+    """Controls when Discord notifications are sent."""
+
+    off = "off"
+    """Never send Discord messages."""
+
+    changes = "changes"
+    """Post only when hotel availability status changes."""
+
+    every = "every"
+    """Post a full summary after every poll cycle."""
 
 
 class Settings(BaseSettings):
@@ -34,12 +49,28 @@ class Settings(BaseSettings):
     """Check-out date in YYYY-MM-DD format."""
 
     # ── Monitoring ───────────────────────────────────────────────────────
-    poll_interval_seconds: int = 60
+    poll_interval_seconds: int = 300
     """How often to poll the API when running in monitor mode."""
 
     # ── Notifications (optional) ─────────────────────────────────────────
     discord_webhook_url: str | None = None
     """If set, availability changes are posted to this Discord webhook."""
+
+    discord_bot_token: str | None = None
+    """Discord bot token for sending DMs. Takes priority over webhook."""
+
+    discord_user_id: str | None = None
+    """Your Discord user ID. Required when using bot DMs."""
+
+    notify_mode: NotifyMode = NotifyMode.changes
+    """When to send Discord notifications: off, changes, or every."""
+
+    @property
+    def discord_configured(self) -> bool:
+        """Return True if any Discord delivery method is configured."""
+        return bool(self.discord_bot_token and self.discord_user_id) or bool(
+            self.discord_webhook_url
+        )
 
     # ── Display ──────────────────────────────────────────────────────────
     show_soldout: bool = False

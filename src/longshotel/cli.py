@@ -10,7 +10,7 @@ import sys
 from rich.console import Console
 
 from longshotel.client import fetch_hotels
-from longshotel.config import Settings
+from longshotel.config import NotifyMode, Settings
 from longshotel.display import print_hotels
 from longshotel.monitor import run_monitor
 
@@ -73,6 +73,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Enable debug logging",
     )
+    mon_p.add_argument(
+        "--notify",
+        choices=[m.value for m in NotifyMode],
+        default=None,
+        help="Notification mode: off, changes (default), or every",
+    )
 
     return parser.parse_args(argv)
 
@@ -89,6 +95,8 @@ def _settings_from_args(args: argparse.Namespace) -> Settings:
         overrides["poll_interval_seconds"] = args.interval
     if getattr(args, "verbose", False):
         overrides["verbose"] = True
+    if getattr(args, "notify", None):
+        overrides["notify_mode"] = args.notify
     return Settings(**overrides)  # type: ignore[arg-type]
 
 
