@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "longshotel"
 version = "0.1.0"
-description = "Monitor hotel availability for San Diego Comic-Con 2026 via the OnPeak Compass API"
+description = "A longshot if you would."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
