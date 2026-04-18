@@ -220,12 +220,20 @@ def _parse_hotels_from_data(data: dict[str, Any]) -> list[Hotel]:
     # The API returns hotels as a list; support dict (legacy) as fallback.
     items = raw_hotels if isinstance(raw_hotels, list) else raw_hotels.values()
     hotels: list[Hotel] = []
+    skipped = 0
     for hotel_data in items:
         try:
             hotels.append(Hotel.model_validate(hotel_data))
-        except Exception:
+        except Exception as exc:
+            skipped += 1
+            hotel_name = hotel_data.get("name", "?") if isinstance(hotel_data, dict) else "?"
+            log.warning("[parse] skipped hotel %r: %s", hotel_name, exc)
             continue
+    if skipped:
+        log.warning("[parse] %d/%d hotel entries failed to parse", skipped, len(raw_hotels))
     hotels.sort(key=lambda h: h.distance)
+    for h in hotels:
+        log.debug("[parse] hotel %d %-40s status=%-12s rate=%s", h.hotel_id, h.name, h.status, h.display_rate)
     return hotels
 
 
@@ -281,13 +289,21 @@ def _parse_hotels(resp: httpx.Response) -> list[Hotel]:
     items = raw_hotels if isinstance(raw_hotels, list) else raw_hotels.values()
 
     hotels: list[Hotel] = []
+    skipped = 0
     for hotel_data in items:
         try:
             hotels.append(Hotel.model_validate(hotel_data))
-        except Exception:
+        except Exception as exc:
+            skipped += 1
+            hotel_name = hotel_data.get("name", "?") if isinstance(hotel_data, dict) else "?"
+            log.warning("[parse] skipped hotel %r: %s", hotel_name, exc)
             continue
+    if skipped:
+        log.warning("[parse] %d/%d hotel entries failed to parse", skipped, len(raw_hotels))
 
     hotels.sort(key=lambda h: h.distance)
+    for h in hotels:
+        log.debug("[parse] hotel %d %-40s status=%-12s rate=%s", h.hotel_id, h.name, h.status, h.display_rate)
     return hotels
 
 

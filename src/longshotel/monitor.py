@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from datetime import datetime, timezone
 
@@ -19,10 +20,35 @@ from longshotel.notifications import (
 )
 
 console = Console()
+log = logging.getLogger(__name__)
+
+# If the hotel count drops below this fraction of the previous count we
+# treat the response as degraded and skip the diff to avoid corrupting
+# baseline state.  e.g. 0.5 = skip if we got less than half as many hotels.
+_DEGRADED_RATIO = 0.5
 
 
 def _available_ids(hotels: list[Hotel]) -> set[int]:
     return {h.hotel_id for h in hotels if h.is_available}
+
+
+def _log_cycle_summary(
+    now: str,
+    hotels: list[Hotel],
+    current_available: set[int],
+) -> None:
+    """Emit a structured INFO log line summarising this poll cycle."""
+    statuses: dict[str, int] = {}
+    for h in hotels:
+        statuses[h.status] = statuses.get(h.status, 0) + 1
+    status_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
+    log.info(
+        "[monitor] %s | hotels=%d available=%d | %s",
+        now,
+        len(hotels),
+        len(current_available),
+        status_breakdown,
+    )
 
 
 async def run_monitor(settings: Settings | None = None) -> None:
@@ -49,7 +75,9 @@ async def run_monitor(settings: Settings | None = None) -> None:
         notify_mode = NotifyMode.off
 
     previous_available: set[int] | None = None
+    previous_hotel_count: int = 0
     hotels_by_id: dict[int, Hotel] = {}
+    consecutive_errors: int = 0
 
     jitter_label = (
         f" (±{settings.poll_jitter_seconds}s jitter)"
@@ -65,14 +93,64 @@ async def run_monitor(settings: Settings | None = None) -> None:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         try:
             hotels = await fetch_hotels(settings)
+            consecutive_errors = 0
         except Exception as exc:
-            console.print(f"[red][{now}] Error fetching hotels: {exc}[/red]")
+            consecutive_errors += 1
+            level = logging.ERROR if consecutive_errors >= 3 else logging.WARNING
+            log.log(
+                level,
+                "[monitor] %s | fetch failed (attempt %d): %s",
+                now, consecutive_errors, exc,
+            )
+            console.print(
+                f"[red][{now}] Error fetching hotels "
+                f"(consecutive failures: {consecutive_errors}): {exc}[/red]"
+            )
+            jitter = random.uniform(0, settings.poll_jitter_seconds)
+            await asyncio.sleep(settings.poll_interval_seconds + jitter)
+            continue
+
+        # ── Guard: skip diff if the response looks degraded ──────────
+        if not hotels:
+            log.warning(
+                "[monitor] %s | empty hotel list returned — skipping diff "
+                "to preserve baseline state",
+                now,
+            )
+            console.print(
+                f"[yellow][{now}] Empty response from API — "
+                f"skipping this cycle (baseline preserved)[/yellow]"
+            )
+            jitter = random.uniform(0, settings.poll_jitter_seconds)
+            await asyncio.sleep(settings.poll_interval_seconds + jitter)
+            continue
+
+        if (
+            previous_hotel_count > 0
+            and len(hotels) < previous_hotel_count * _DEGRADED_RATIO
+        ):
+            log.warning(
+                "[monitor] %s | hotel count dropped from %d to %d "
+                "(below %.0f%% threshold) — skipping diff to preserve baseline",
+                now,
+                previous_hotel_count,
+                len(hotels),
+                _DEGRADED_RATIO * 100,
+            )
+            console.print(
+                f"[yellow][{now}] Degraded response "
+                f"({len(hotels)}/{previous_hotel_count} hotels) — "
+                f"skipping this cycle (baseline preserved)[/yellow]"
+            )
             jitter = random.uniform(0, settings.poll_jitter_seconds)
             await asyncio.sleep(settings.poll_interval_seconds + jitter)
             continue
 
         hotels_by_id = {h.hotel_id: h for h in hotels}
         current_available = _available_ids(hotels)
+
+        # ── Structured per-cycle log ─────────────────────────────────
+        _log_cycle_summary(now, hotels, current_available)
 
         if previous_available is None:
             # First run – just display the current state
@@ -83,6 +161,10 @@ async def run_monitor(settings: Settings | None = None) -> None:
             newly_soldout = previous_available - current_available
 
             if newly_available or newly_soldout:
+                log.info(
+                    "[monitor] %s | changes: +%d available, -%d sold out",
+                    now, len(newly_available), len(newly_soldout),
+                )
                 console.print(f"\n[bold yellow][{now}] Change detected![/bold yellow]")
                 for hid in newly_available:
                     h = hotels_by_id[hid]
@@ -137,5 +219,6 @@ async def run_monitor(settings: Settings | None = None) -> None:
                 )
 
         previous_available = current_available
+        previous_hotel_count = len(hotels)
         jitter = random.uniform(0, settings.poll_jitter_seconds)
         await asyncio.sleep(settings.poll_interval_seconds + jitter)
