@@ -121,8 +121,8 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     settings = _settings_from_args(args)
 
-    if settings.verbose:
-        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(message)s")
+    log_level = logging.DEBUG if settings.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s %(message)s")
 
     if args.command == "check":
         asyncio.run(_check(settings))

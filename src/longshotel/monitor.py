@@ -9,11 +9,12 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
-from longshotel.client import fetch_hotels
+from longshotel.client import fetch_hotels_dual
 from longshotel.config import NotifyMode, Settings
 from longshotel.display import print_hotels
 from longshotel.models import Hotel
 from longshotel.notifications import (
+    send_discord_general_notification,
     send_discord_notification,
     send_discord_soldout_notification,
     send_discord_summary,
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 
 # If the hotel count drops below this fraction of the previous count we
 # treat the response as degraded and skip the diff to avoid corrupting
-# baseline state.  e.g. 0.5 = skip if we got less than half as many hotels.
+# baseline state.
 _DEGRADED_RATIO = 0.5
 
 
@@ -34,21 +35,40 @@ def _available_ids(hotels: list[Hotel]) -> set[int]:
 
 def _log_cycle_summary(
     now: str,
+    label: str,
     hotels: list[Hotel],
     current_available: set[int],
 ) -> None:
-    """Emit a structured INFO log line summarising this poll cycle."""
     statuses: dict[str, int] = {}
     for h in hotels:
         statuses[h.status] = statuses.get(h.status, 0) + 1
     status_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(statuses.items()))
     log.info(
-        "[monitor] %s | hotels=%d available=%d | %s",
-        now,
-        len(hotels),
-        len(current_available),
-        status_breakdown,
+        "[monitor] %s | %s | hotels=%d available=%d | %s",
+        now, label, len(hotels), len(current_available), status_breakdown,
     )
+
+
+def _is_degraded(hotels: list[Hotel], previous_count: int, now: str, label: str) -> bool:
+    if not hotels:
+        log.warning("[monitor] %s | %s: empty hotel list — skipping diff", now, label)
+        console.print(
+            f"[yellow][{now}] Empty {label} response — "
+            f"skipping this cycle (baseline preserved)[/yellow]"
+        )
+        return True
+    if previous_count > 0 and len(hotels) < previous_count * _DEGRADED_RATIO:
+        log.warning(
+            "[monitor] %s | %s: hotel count dropped from %d to %d — skipping diff",
+            now, label, previous_count, len(hotels),
+        )
+        console.print(
+            f"[yellow][{now}] Degraded {label} response "
+            f"({len(hotels)}/{previous_count} hotels) — "
+            f"skipping this cycle (baseline preserved)[/yellow]"
+        )
+        return True
+    return False
 
 
 async def run_monitor(settings: Settings | None = None) -> None:
@@ -56,10 +76,10 @@ async def run_monitor(settings: Settings | None = None) -> None:
 
     On each tick the monitor:
 
-    1. Fetches the latest hotel list.
-    2. Compares with the previous snapshot.
+    1. Fetches both general and date-specific hotel availability.
+    2. Compares each with their previous snapshots.
     3. Prints a summary of any changes.
-    4. Fires optional notifications for newly-available hotels.
+    4. Fires optional notifications for changes in either set.
     """
     if settings is None:
         settings = Settings()
@@ -74,9 +94,10 @@ async def run_monitor(settings: Settings | None = None) -> None:
         )
         notify_mode = NotifyMode.off
 
-    previous_available: set[int] | None = None
-    previous_hotel_count: int = 0
-    hotels_by_id: dict[int, Hotel] = {}
+    prev_general_available: set[int] | None = None
+    prev_dated_available: set[int] | None = None
+    prev_general_count: int = 0
+    prev_dated_count: int = 0
     consecutive_errors: int = 0
 
     jitter_label = (
@@ -86,13 +107,15 @@ async def run_monitor(settings: Settings | None = None) -> None:
     )
     console.print(
         f"[bold cyan]Starting monitor[/bold cyan] — polling every "
-        f"{settings.poll_interval_seconds}s{jitter_label}  (Ctrl+C to stop)\n"
+        f"{settings.poll_interval_seconds}s{jitter_label}\n"
+        f"  Tracking: general availability + "
+        f"{settings.arrive} → {settings.depart}  (Ctrl+C to stop)\n"
     )
 
     while True:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         try:
-            hotels = await fetch_hotels(settings)
+            result = await fetch_hotels_dual(settings)
             consecutive_errors = 0
         except Exception as exc:
             consecutive_errors += 1
@@ -110,115 +133,130 @@ async def run_monitor(settings: Settings | None = None) -> None:
             await asyncio.sleep(settings.poll_interval_seconds + jitter)
             continue
 
-        # ── Guard: skip diff if the response looks degraded ──────────
-        if not hotels:
-            log.warning(
-                "[monitor] %s | empty hotel list returned — skipping diff "
-                "to preserve baseline state",
-                now,
-            )
-            console.print(
-                f"[yellow][{now}] Empty response from API — "
-                f"skipping this cycle (baseline preserved)[/yellow]"
-            )
+        general_hotels = result.general
+        dated_hotels = result.dated
+
+        # ── Guard: skip diff if either response looks degraded ───────
+        if _is_degraded(general_hotels, prev_general_count, now, "general") or \
+                _is_degraded(dated_hotels, prev_dated_count, now, "dated"):
             jitter = random.uniform(0, settings.poll_jitter_seconds)
             await asyncio.sleep(settings.poll_interval_seconds + jitter)
             continue
 
-        if (
-            previous_hotel_count > 0
-            and len(hotels) < previous_hotel_count * _DEGRADED_RATIO
-        ):
-            log.warning(
-                "[monitor] %s | hotel count dropped from %d to %d "
-                "(below %.0f%% threshold) — skipping diff to preserve baseline",
-                now,
-                previous_hotel_count,
-                len(hotels),
-                _DEGRADED_RATIO * 100,
-            )
-            console.print(
-                f"[yellow][{now}] Degraded response "
-                f"({len(hotels)}/{previous_hotel_count} hotels) — "
-                f"skipping this cycle (baseline preserved)[/yellow]"
-            )
-            jitter = random.uniform(0, settings.poll_jitter_seconds)
-            await asyncio.sleep(settings.poll_interval_seconds + jitter)
-            continue
+        general_by_id = {h.hotel_id: h for h in general_hotels}
+        dated_by_id = {h.hotel_id: h for h in dated_hotels}
+        cur_general_available = _available_ids(general_hotels)
+        cur_dated_available = _available_ids(dated_hotels)
 
-        hotels_by_id = {h.hotel_id: h for h in hotels}
-        current_available = _available_ids(hotels)
+        # ── Structured per-cycle logs ────────────────────────────────
+        _log_cycle_summary(now, "general", general_hotels, cur_general_available)
+        _log_cycle_summary(now, f"{settings.arrive}–{settings.depart}", dated_hotels, cur_dated_available)
 
-        # ── Structured per-cycle log ─────────────────────────────────
-        _log_cycle_summary(now, hotels, current_available)
-
-        if previous_available is None:
-            # First run – just display the current state
+        if prev_general_available is None:
+            # First run
             console.print(f"[dim][{now}] Initial fetch complete[/dim]")
-            print_hotels(hotels, show_soldout=settings.show_soldout)
+            console.print(f"\n[bold]Date-specific ({settings.arrive} → {settings.depart}):[/bold]")
+            print_hotels(dated_hotels, show_soldout=settings.show_soldout)
+
+            # Show hotels with general availability but not for user's dates
+            general_only = cur_general_available - cur_dated_available
+            if general_only:
+                console.print(
+                    f"\n[bold cyan]ℹ {len(general_only)} hotel(s) have rooms for "
+                    f"OTHER dates (not {settings.arrive}–{settings.depart}):[/bold cyan]"
+                )
+                for hid in general_only:
+                    h = general_by_id[hid]
+                    console.print(f"  [cyan]○ {h.name}[/cyan] ({h.hotel_chain})")
         else:
-            newly_available = current_available - previous_available
-            newly_soldout = previous_available - current_available
+            any_change = False
+
+            # ── Date-specific changes ────────────────────────────────
+            newly_available = cur_dated_available - prev_dated_available
+            newly_soldout = prev_dated_available - cur_dated_available
 
             if newly_available or newly_soldout:
+                any_change = True
                 log.info(
-                    "[monitor] %s | changes: +%d available, -%d sold out",
+                    "[monitor] %s | dated changes: +%d available, -%d sold out",
                     now, len(newly_available), len(newly_soldout),
                 )
-                console.print(f"\n[bold yellow][{now}] Change detected![/bold yellow]")
+                console.print(
+                    f"\n[bold yellow][{now}] Change detected "
+                    f"({settings.arrive}–{settings.depart})![/bold yellow]"
+                )
                 for hid in newly_available:
-                    h = hotels_by_id[hid]
+                    h = dated_by_id[hid]
                     console.print(
                         f"  [green]+ AVAILABLE:[/green] {h.name} "
                         f"(${h.display_rate:,.2f}/night)"
                     )
                 for hid in newly_soldout:
-                    h = hotels_by_id.get(hid)
+                    h = dated_by_id.get(hid)
                     name = h.name if h else f"Hotel #{hid}"
                     console.print(f"  [red]- SOLD OUT:[/red] {name}")
 
-                # Fire change notifications
                 if notify_mode == NotifyMode.changes and settings.discord_configured:
-                    new_hotels = [hotels_by_id[hid] for hid in newly_available]
+                    new_hotels = [dated_by_id[hid] for hid in newly_available]
                     soldout_hotels = [
-                        hotels_by_id[hid]
-                        for hid in newly_soldout
-                        if hid in hotels_by_id
+                        dated_by_id[hid] for hid in newly_soldout if hid in dated_by_id
                     ]
                     try:
-                        await send_discord_notification(
-                            settings, new_hotels,
-                        )
+                        await send_discord_notification(settings, new_hotels)
                     except Exception as exc:
-                        console.print(
-                            f"  [red]Discord notification failed: {exc}[/red]"
-                        )
+                        console.print(f"  [red]Discord notification failed: {exc}[/red]")
                     try:
-                        await send_discord_soldout_notification(
-                            settings, soldout_hotels,
+                        await send_discord_soldout_notification(settings, soldout_hotels)
+                    except Exception as exc:
+                        console.print(f"  [red]Discord notification failed: {exc}[/red]")
+
+            # ── General availability changes (any dates) ─────────────
+            # Only report hotels that are newly available generally but NOT
+            # already available for the user's specific dates (avoid duplicate alerts).
+            gen_only_new = (cur_general_available - prev_general_available) - cur_dated_available
+
+            if gen_only_new:
+                any_change = True
+                log.info(
+                    "[monitor] %s | general changes: %d hotel(s) now have rooms for other dates",
+                    now, len(gen_only_new),
+                )
+                console.print(
+                    f"\n[bold cyan][{now}] {len(gen_only_new)} hotel(s) now have rooms "
+                    f"for OTHER dates (not {settings.arrive}–{settings.depart}):[/bold cyan]"
+                )
+                for hid in gen_only_new:
+                    h = general_by_id[hid]
+                    console.print(f"  [cyan]○ {h.name}[/cyan] ({h.hotel_chain})")
+
+                if notify_mode == NotifyMode.changes and settings.discord_configured:
+                    try:
+                        await send_discord_general_notification(
+                            settings,
+                            [general_by_id[hid] for hid in gen_only_new],
+                            settings.arrive,
+                            settings.depart,
                         )
                     except Exception as exc:
-                        console.print(
-                            f"  [red]Discord notification failed: {exc}[/red]"
-                        )
-            else:
+                        console.print(f"  [red]Discord notification failed: {exc}[/red]")
+
+            if not any_change:
                 console.print(
                     f"[dim][{now}] No changes "
-                    f"({len(current_available)} available)[/dim]"
+                    f"({len(cur_dated_available)} dated, "
+                    f"{len(cur_general_available)} general)[/dim]"
                 )
 
         # Fire summary notification every poll (after first run)
         if notify_mode == NotifyMode.every and settings.discord_configured:
             try:
-                await send_discord_summary(
-                    settings, hotels,
-                )
+                await send_discord_summary(settings, dated_hotels)
             except Exception as exc:
-                console.print(
-                    f"  [red]Discord summary failed: {exc}[/red]"
-                )
+                console.print(f"  [red]Discord summary failed: {exc}[/red]")
 
-        previous_available = current_available
-        previous_hotel_count = len(hotels)
+        prev_general_available = cur_general_available
+        prev_dated_available = cur_dated_available
+        prev_general_count = len(general_hotels)
+        prev_dated_count = len(dated_hotels)
         jitter = random.uniform(0, settings.poll_jitter_seconds)
         await asyncio.sleep(settings.poll_interval_seconds + jitter)

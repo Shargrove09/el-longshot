@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -12,6 +13,17 @@ from longshotel.config import Settings
 from longshotel.models import Hotel
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class FetchResult:
+    """Holds both general and date-specific hotel availability."""
+
+    general: list[Hotel] = field(default_factory=list)
+    """Hotels from the initial /avail call (no date filter)."""
+
+    dated: list[Hotel] = field(default_factory=list)
+    """Hotels for the user's specific arrive/depart range."""
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -51,8 +63,12 @@ def _build_params(settings: Settings) -> dict[str, str]:
 _NAVIGATE_TIMEOUT_MS = 30_000
 
 
-async def _fetch_via_browser(settings: Settings) -> list[Hotel]:
+async def _fetch_via_browser(settings: Settings) -> FetchResult:
     """Navigate the OnPeak category page and intercept the /avail XHR.
+
+    Returns a ``FetchResult`` containing:
+    * **general** — availability from the initial page XHR (no date filter).
+    * **dated** — availability for the user's arrive/depart range.
 
     Strategy
     --------
@@ -149,6 +165,13 @@ async def _fetch_via_browser(settings: Settings) -> list[Hotel]:
             discovered_block, initial_data = avail_future.result()
             log.debug("[browser] discovered block index: %d", discovered_block)
 
+            general_hotels = _parse_hotels_from_data(initial_data)
+            log.info(
+                "[browser] general availability: %d hotels, %d available",
+                len(general_hotels),
+                sum(1 for h in general_hotels if h.is_available),
+            )
+
             # If dates were specified, make a follow-up /avail call with them
             # (the page's initial XHR may not include arrive/depart).
             if settings.arrive and settings.depart:
@@ -172,14 +195,15 @@ async def _fetch_via_browser(settings: Settings) -> list[Hotel]:
                             "[browser] /avail with dates returned %d hotel entries",
                             len(body.get("hotels", [])),
                         )
+                        dated_hotels = _parse_hotels_from_data(body)
                         await browser.close()
-                        return _parse_hotels_from_data(body)
+                        return FetchResult(general=general_hotels, dated=dated_hotels)
                 except Exception as exc:
-                    log.debug("[browser] follow-up /avail failed: %s — using initial data", exc)
+                    log.debug("[browser] follow-up /avail failed: %s — using initial data for both", exc)
 
-            # Fall back to the initial intercepted data.
+            # Fall back to the initial intercepted data for both.
             await browser.close()
-            return _parse_hotels_from_data(initial_data)
+            return FetchResult(general=general_hotels, dated=general_hotels)
 
         # No /avail response was intercepted — try a manual call using the
         # fallback block_index from settings.
@@ -200,7 +224,8 @@ async def _fetch_via_browser(settings: Settings) -> list[Hotel]:
             body = await resp.json()
             if isinstance(body, dict) and "hotels" in body:
                 await browser.close()
-                return _parse_hotels_from_data(body)
+                dated = _parse_hotels_from_data(body)
+                return FetchResult(general=dated, dated=dated)
         except Exception as exc:
             log.debug("[browser] fallback /avail failed: %s", exc)
 
@@ -210,7 +235,7 @@ async def _fetch_via_browser(settings: Settings) -> list[Hotel]:
         "Could not retrieve hotel data — the sale may not be active yet "
         "for this event / date range."
     )
-    return []
+    return FetchResult()
 
 
 def _parse_hotels_from_data(data: dict[str, Any]) -> list[Hotel]:
@@ -246,7 +271,7 @@ async def fetch_hotels(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> list[Hotel]:
-    """Fetch the current hotel availability list.
+    """Fetch date-specific hotel availability.
 
     When *client* is provided (unit tests), a single direct ``/avail`` call
     is made via ``httpx``.  For live requests the function delegates to a
@@ -264,6 +289,16 @@ async def fetch_hotels(
         resp.raise_for_status()
         return _parse_hotels(resp)
 
+    result = await _fetch_via_browser(settings)
+    return result.dated
+
+
+async def fetch_hotels_dual(
+    settings: Settings | None = None,
+) -> FetchResult:
+    """Fetch both general and date-specific availability in one browser session."""
+    if settings is None:
+        settings = Settings()
     return await _fetch_via_browser(settings)
 
 

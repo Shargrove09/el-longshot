@@ -171,3 +171,24 @@ async def send_discord_summary(
             lines.append(f"• ~~{h.name}~~ ({h.hotel_chain})")
 
     await _send_discord(settings, "\n".join(lines))
+
+
+async def send_discord_general_notification(
+    settings: Settings,
+    hotels: list[Hotel],
+    arrive: str,
+    depart: str,
+) -> None:
+    """Post a message about hotels with new general availability (any dates)."""
+    if not hotels:
+        return
+
+    lines = [
+        f"**🔔 Hotels now available for OTHER dates (not {arrive}–{depart})**\n",
+        "Check OnPeak for exact date ranges:\n",
+    ]
+    lines.extend(
+        f"• **{h.name}** ({h.hotel_chain}) — {h.distance:.2f} mi"
+        for h in hotels
+    )
+    await _send_discord(settings, "\n".join(lines))
