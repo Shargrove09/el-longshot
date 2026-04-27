@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,10 @@ from longshotel.models import Hotel
 log = logging.getLogger(__name__)
 
 
+class RateLimitedError(Exception):
+    """Raised when the server signals the IP is blocked (HTTP 406 or 429)."""
+
+
 @dataclass
 class FetchResult:
     """Holds both general and date-specific hotel availability."""
@@ -25,11 +30,17 @@ class FetchResult:
     dated: list[Hotel] = field(default_factory=list)
     """Hotels for the user's specific arrive/depart range."""
 
-_BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+_BROWSER_UA_POOL = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+_BROWSER_UA = _BROWSER_UA_POOL[0]
+
+
+def _random_ua() -> str:
+    return random.choice(_BROWSER_UA_POOL)
+
 
 _JSON_HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -58,8 +69,9 @@ async def _fetch_via_httpx(settings: Settings) -> FetchResult | None:
 
     event_url = f"{settings.base_url}/e/{settings.event_code}"
 
+    req_headers = {**_JSON_HEADERS, "User-Agent": _random_ua()}
     async with httpx.AsyncClient(
-        headers=_JSON_HEADERS,
+        headers=req_headers,
         follow_redirects=True,
         timeout=20,
     ) as client:
@@ -100,8 +112,14 @@ async def _fetch_via_httpx(settings: Settings) -> FetchResult | None:
                 avail_url,
                 params={"_": str(int(time.time() * 1000))},
             )
+            if general_resp.status_code in (406, 429):
+                raise RateLimitedError(
+                    f"HTTP {general_resp.status_code} from OnPeak — IP may be blocked"
+                )
             general_resp.raise_for_status()
             general_data: dict = general_resp.json()
+        except RateLimitedError:
+            raise
         except Exception as exc:
             log.debug("[fetch] httpx general /avail failed: %s", exc)
             return None
@@ -133,8 +151,14 @@ async def _fetch_via_httpx(settings: Settings) -> FetchResult | None:
 
         try:
             dated_resp = await client.get(avail_url, params=_build_params(settings))
+            if dated_resp.status_code in (406, 429):
+                raise RateLimitedError(
+                    f"HTTP {dated_resp.status_code} from OnPeak — IP may be blocked"
+                )
             dated_resp.raise_for_status()
             dated_data: dict = dated_resp.json()
+        except RateLimitedError:
+            raise
         except Exception as exc:
             log.debug("[fetch] httpx dated /avail failed: %s — using general data", exc)
             return FetchResult(general=general_hotels, dated=general_hotels)
@@ -209,7 +233,7 @@ async def _fetch_via_browser(settings: Settings) -> FetchResult:
             ],
         )
         context = await browser.new_context(
-            user_agent=_BROWSER_UA,
+            user_agent=_random_ua(),
             locale="en-US",
             timezone_id="America/Los_Angeles",
         )
@@ -299,6 +323,11 @@ async def _fetch_via_browser(settings: Settings) -> FetchResult:
                             "Referer": page.url,
                         },
                     )
+                    if resp.status in (406, 429):
+                        await browser.close()
+                        raise RateLimitedError(
+                            f"HTTP {resp.status} from OnPeak — IP may be blocked"
+                        )
                     body = await resp.json()
                     if isinstance(body, dict) and "hotels" in body:
                         log.info(
@@ -308,6 +337,8 @@ async def _fetch_via_browser(settings: Settings) -> FetchResult:
                         dated_hotels = _parse_hotels_from_data(body)
                         await browser.close()
                         return FetchResult(general=general_hotels, dated=dated_hotels)
+                except RateLimitedError:
+                    raise
                 except Exception as exc:
                     log.debug("[browser] follow-up /avail failed: %s — using initial data for both", exc)
 
@@ -331,11 +362,18 @@ async def _fetch_via_browser(settings: Settings) -> FetchResult:
                     "Referer": page.url,
                 },
             )
+            if resp.status in (406, 429):
+                await browser.close()
+                raise RateLimitedError(
+                    f"HTTP {resp.status} from OnPeak — IP may be blocked"
+                )
             body = await resp.json()
             if isinstance(body, dict) and "hotels" in body:
                 await browser.close()
                 dated = _parse_hotels_from_data(body)
                 return FetchResult(general=dated, dated=dated)
+        except RateLimitedError:
+            raise
         except Exception as exc:
             log.debug("[browser] fallback /avail failed: %s", exc)
 

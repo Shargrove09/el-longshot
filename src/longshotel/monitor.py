@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from rich.console import Console
 
-from longshotel.client import fetch_hotels_dual
+from longshotel.client import RateLimitedError, fetch_hotels_dual
 from longshotel.config import NotifyMode, Settings
 from longshotel.display import print_hotels
 from longshotel.models import Hotel
@@ -71,6 +71,29 @@ def _is_degraded(hotels: list[Hotel], previous_count: int, now: str, label: str)
     return False
 
 
+def _compute_sleep_seconds(settings: Settings, consecutive_errors: int) -> float:
+    """Return how long to sleep before the next poll cycle."""
+    if consecutive_errors > 0:
+        base = settings.poll_interval_seconds * (2 ** (consecutive_errors - 1))
+        capped = min(base, settings.backoff_max_seconds)
+        return capped + random.uniform(0, capped * 0.2)
+
+    hour = datetime.now().hour
+    start, end = settings.quiet_hours_start, settings.quiet_hours_end
+    if start != end:
+        in_quiet = (
+            (hour >= start or hour < end)  # midnight-crossing window
+            if start > end
+            else (start <= hour < end)     # same-day window
+        )
+        if in_quiet:
+            interval = settings.quiet_hours_interval_seconds
+            return interval + random.uniform(0, interval * 0.2)
+
+    interval = settings.poll_interval_seconds
+    return interval + random.uniform(0, interval * 0.2)
+
+
 async def run_monitor(settings: Settings | None = None) -> None:
     """Run the polling monitor loop.
 
@@ -100,14 +123,16 @@ async def run_monitor(settings: Settings | None = None) -> None:
     prev_dated_count: int = 0
     consecutive_errors: int = 0
 
-    jitter_label = (
-        f" (±{settings.poll_jitter_seconds}s jitter)"
-        if settings.poll_jitter_seconds
-        else ""
-    )
+    quiet_info = ""
+    if settings.quiet_hours_start != settings.quiet_hours_end:
+        quiet_info = (
+            f"\n  Quiet hours: {settings.quiet_hours_start:02d}:00–"
+            f"{settings.quiet_hours_end:02d}:00 local "
+            f"(interval: {settings.quiet_hours_interval_seconds}s)"
+        )
     console.print(
         f"[bold cyan]Starting monitor[/bold cyan] — polling every "
-        f"{settings.poll_interval_seconds}s{jitter_label}\n"
+        f"{settings.poll_interval_seconds}s (+20% jitter){quiet_info}\n"
         f"  Tracking: general availability + "
         f"{settings.arrive} → {settings.depart}  (Ctrl+C to stop)\n"
     )
@@ -117,6 +142,18 @@ async def run_monitor(settings: Settings | None = None) -> None:
         try:
             result = await fetch_hotels_dual(settings)
             consecutive_errors = 0
+        except RateLimitedError as exc:
+            consecutive_errors += 1
+            log.error(
+                "[monitor] %s | rate limited (attempt %d): %s",
+                now, consecutive_errors, exc,
+            )
+            console.print(
+                f"[bold red][{now}] Rate limited / blocked "
+                f"(consecutive: {consecutive_errors}) — backing off[/bold red]"
+            )
+            await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))
+            continue
         except Exception as exc:
             consecutive_errors += 1
             level = logging.ERROR if consecutive_errors >= 3 else logging.WARNING
@@ -129,8 +166,7 @@ async def run_monitor(settings: Settings | None = None) -> None:
                 f"[red][{now}] Error fetching hotels "
                 f"(consecutive failures: {consecutive_errors}): {exc}[/red]"
             )
-            jitter = random.uniform(0, settings.poll_jitter_seconds)
-            await asyncio.sleep(settings.poll_interval_seconds + jitter)
+            await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))
             continue
 
         general_hotels = result.general
@@ -139,8 +175,7 @@ async def run_monitor(settings: Settings | None = None) -> None:
         # ── Guard: skip diff if either response looks degraded ───────
         if _is_degraded(general_hotels, prev_general_count, now, "general") or \
                 _is_degraded(dated_hotels, prev_dated_count, now, "dated"):
-            jitter = random.uniform(0, settings.poll_jitter_seconds)
-            await asyncio.sleep(settings.poll_interval_seconds + jitter)
+            await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))
             continue
 
         general_by_id = {h.hotel_id: h for h in general_hotels}
@@ -258,5 +293,4 @@ async def run_monitor(settings: Settings | None = None) -> None:
         prev_dated_available = cur_dated_available
         prev_general_count = len(general_hotels)
         prev_dated_count = len(dated_hotels)
-        jitter = random.uniform(0, settings.poll_jitter_seconds)
-        await asyncio.sleep(settings.poll_interval_seconds + jitter)
+        await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))

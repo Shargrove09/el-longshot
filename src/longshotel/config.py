@@ -55,6 +55,18 @@ class Settings(BaseSettings):
     poll_jitter_seconds: int = 30
     """Random jitter added to each poll interval (0 to this value)."""
 
+    quiet_hours_start: int = 2
+    """Local hour (0–23) when quiet polling begins (default 2am)."""
+
+    quiet_hours_end: int = 7
+    """Local hour (0–23) when quiet polling ends (default 7am)."""
+
+    quiet_hours_interval_seconds: int = 1800
+    """Poll interval during quiet hours (default 30 min)."""
+
+    backoff_max_seconds: int = 3600
+    """Cap for exponential backoff on consecutive errors (default 1 hr)."""
+
     # ── Notifications (optional) ─────────────────────────────────────────
     discord_webhook_url: str | None = None
     """If set, availability changes are posted to this Discord webhook."""
