@@ -26,6 +26,17 @@ def _raise_with_discord_details(resp: httpx.Response, context: str) -> None:
         ) from exc
 
 
+def _interval_label(seconds: int) -> str:
+    """Human label for the periodic report based on its interval."""
+    if seconds == 3600:
+        return "Hourly Report"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}-Hour Report"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}-Minute Report"
+    return f"{seconds}-Second Report"
+
+
 def _format_hotel_line(hotel: Hotel) -> str:
     """Format a single hotel into a bullet-point line."""
     rate = hotel.display_rate
@@ -170,4 +181,73 @@ async def send_discord_summary(
         for h in soldout:
             lines.append(f"• ~~{h.name}~~ ({h.hotel_chain})")
 
+    await _send_discord(settings, "\n".join(lines))
+
+
+async def send_discord_general_notification(
+    settings: Settings,
+    hotels: list[Hotel],
+    arrive: str,
+    depart: str,
+) -> None:
+    """Post a message about hotels with new general availability (any dates)."""
+    if not hotels:
+        return
+
+    lines = [
+        f"**🔔 Hotels now available for OTHER dates (not {arrive}–{depart})**\n",
+        "Check OnPeak for exact date ranges:\n",
+    ]
+    lines.extend(
+        f"• **{h.name}** ({h.hotel_chain}) — {h.distance:.2f} mi"
+        for h in hotels
+    )
+    await _send_discord(settings, "\n".join(lines))
+
+
+async def send_discord_interval_summary(
+    settings: Settings,
+    newly_available_net: list[Hotel],
+    newly_soldout_net: list[Hotel | None],
+    current_available: list[Hotel],
+    poll_count: int,
+    error_count: int,
+    period_start: str,
+    period_end: str,
+) -> None:
+    """Post a periodic interval summary covering net changes since the last report."""
+    arrive, depart = settings.arrive, settings.depart
+    lines = [
+        f"**⏱ {_interval_label(settings.interval_summary_notification_seconds)} — SDCC 2026 ({arrive}–{depart})**",
+        f"Period: {period_start} → {period_end}",
+        f"Polls: {poll_count} | Errors: {error_count}",
+        f"Currently available: {len(current_available)} hotel(s)",
+    ]
+    if newly_available_net:
+        lines.append(f"\n**➕ Became available ({len(newly_available_net)}):**")
+        lines.extend(_format_hotel_line(h) for h in newly_available_net)
+    if newly_soldout_net:
+        lines.append(f"\n**➖ Sold out ({len(newly_soldout_net)}):**")
+        for h in newly_soldout_net:
+            name = h.name if h else "Unknown hotel"
+            chain = f" ({h.hotel_chain})" if h else ""
+            lines.append(f"• **{name}**{chain} — SOLD OUT")
+    if not newly_available_net and not newly_soldout_net:
+        lines.append("\nNo net changes this period.")
+    await _send_discord(settings, "\n".join(lines))
+
+
+async def send_discord_blocking_alert(
+    settings: Settings,
+    consecutive_errors: int,
+    last_error: str,
+    backoff_seconds: float,
+) -> None:
+    """Post a one-time alert when the monitor has been blocked for multiple consecutive cycles."""
+    lines = [
+        "**🚨 Monitor Blocked — SDCC 2026**",
+        f"{consecutive_errors} consecutive fetch failures — may be rate-limited or blocked.",
+        f"Last error: {last_error}",
+        f"Backing off ~{int(backoff_seconds // 60)} min — retrying automatically.",
+    ]
     await _send_discord(settings, "\n".join(lines))
