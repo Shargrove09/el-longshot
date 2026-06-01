@@ -26,6 +26,17 @@ def _raise_with_discord_details(resp: httpx.Response, context: str) -> None:
         ) from exc
 
 
+def _interval_label(seconds: int) -> str:
+    """Human label for the periodic report based on its interval."""
+    if seconds == 3600:
+        return "Hourly Report"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}-Hour Report"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}-Minute Report"
+    return f"{seconds}-Second Report"
+
+
 def _format_hotel_line(hotel: Hotel) -> str:
     """Format a single hotel into a bullet-point line."""
     rate = hotel.display_rate
@@ -207,7 +218,7 @@ async def send_discord_interval_summary(
     """Post a periodic interval summary covering net changes since the last report."""
     arrive, depart = settings.arrive, settings.depart
     lines = [
-        f"**⏱ Hourly Report — SDCC 2026 ({arrive}–{depart})**",
+        f"**⏱ {_interval_label(settings.interval_summary_notification_seconds)} — SDCC 2026 ({arrive}–{depart})**",
         f"Period: {period_start} → {period_end}",
         f"Polls: {poll_count} | Errors: {error_count}",
         f"Currently available: {len(current_available)} hotel(s)",
@@ -223,4 +234,20 @@ async def send_discord_interval_summary(
             lines.append(f"• **{name}**{chain} — SOLD OUT")
     if not newly_available_net and not newly_soldout_net:
         lines.append("\nNo net changes this period.")
+    await _send_discord(settings, "\n".join(lines))
+
+
+async def send_discord_blocking_alert(
+    settings: Settings,
+    consecutive_errors: int,
+    last_error: str,
+    backoff_seconds: float,
+) -> None:
+    """Post a one-time alert when the monitor has been blocked for multiple consecutive cycles."""
+    lines = [
+        "**🚨 Monitor Blocked — SDCC 2026**",
+        f"{consecutive_errors} consecutive fetch failures — may be rate-limited or blocked.",
+        f"Last error: {last_error}",
+        f"Backing off ~{int(backoff_seconds // 60)} min — retrying automatically.",
+    ]
     await _send_discord(settings, "\n".join(lines))

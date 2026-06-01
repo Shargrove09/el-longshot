@@ -15,6 +15,7 @@ from longshotel.config import NotifyMode, Settings
 from longshotel.display import print_hotels
 from longshotel.models import Hotel
 from longshotel.notifications import (
+    send_discord_blocking_alert,
     send_discord_general_notification,
     send_discord_interval_summary,
     send_discord_notification,
@@ -127,6 +128,7 @@ async def run_monitor(settings: Settings | None = None) -> None:
     prev_general_count: int = 0
     prev_dated_count: int = 0
     consecutive_errors: int = 0
+    max_backoff_alert_sent: bool = False
 
     interval_start_time: float | None = None
     interval_start_wall_str: str = ""
@@ -153,6 +155,7 @@ async def run_monitor(settings: Settings | None = None) -> None:
         try:
             result = await fetch_hotels_dual(settings)
             consecutive_errors = 0
+            max_backoff_alert_sent = False
         except RateLimitedError as exc:
             consecutive_errors += 1
             interval_error_count += 1
@@ -164,6 +167,19 @@ async def run_monitor(settings: Settings | None = None) -> None:
                 f"[bold red][{now}] Rate limited / blocked "
                 f"(consecutive: {consecutive_errors}) — backing off[/bold red]"
             )
+            if (
+                settings.max_backoff_alert_threshold > 0
+                and consecutive_errors >= settings.max_backoff_alert_threshold
+                and not max_backoff_alert_sent
+                and notify_mode != NotifyMode.off
+                and settings.discord_configured
+            ):
+                try:
+                    backoff = _compute_sleep_seconds(settings, consecutive_errors)
+                    await send_discord_blocking_alert(settings, consecutive_errors, str(exc), backoff)
+                    max_backoff_alert_sent = True
+                except Exception as alert_exc:
+                    console.print(f"  [red]Discord blocking alert failed: {alert_exc}[/red]")
             await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))
             continue
         except Exception as exc:
@@ -179,6 +195,19 @@ async def run_monitor(settings: Settings | None = None) -> None:
                 f"[red][{now}] Error fetching hotels "
                 f"(consecutive failures: {consecutive_errors}): {exc}[/red]"
             )
+            if (
+                settings.max_backoff_alert_threshold > 0
+                and consecutive_errors >= settings.max_backoff_alert_threshold
+                and not max_backoff_alert_sent
+                and notify_mode != NotifyMode.off
+                and settings.discord_configured
+            ):
+                try:
+                    backoff = _compute_sleep_seconds(settings, consecutive_errors)
+                    await send_discord_blocking_alert(settings, consecutive_errors, str(exc), backoff)
+                    max_backoff_alert_sent = True
+                except Exception as alert_exc:
+                    console.print(f"  [red]Discord blocking alert failed: {alert_exc}[/red]")
             await asyncio.sleep(_compute_sleep_seconds(settings, consecutive_errors))
             continue
 

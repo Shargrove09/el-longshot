@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     interval_summary_notification_seconds: int = 3600
     """Send a periodic Discord summary every N seconds (0 = disabled). Default 1 hour."""
 
+    max_backoff_alert_threshold: int = 3
+    """Send a Discord alert after this many consecutive fetch errors (0 = disabled). Default 3."""
+
     # ── Notifications (optional) ─────────────────────────────────────────
     discord_webhook_url: str | None = None
     """If set, availability changes are posted to this Discord webhook."""
